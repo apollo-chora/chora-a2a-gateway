@@ -1,0 +1,84 @@
+# PII_Closure_Map for chora-a2a-gateway domain.
+#
+# Source-of-truth: .claude/skills/account-closure-saga/SKILL.md
+# Owning team: Team 3 (Platform). Owning DB: chora_a2a.
+#
+# A2A is external-agent + AGID territory. The CLOSING saga is for GCID
+# (human user) — agents (AGID) have NO lifecycle saga (per ddd-enforcement
+# invariant #10). Per Coordinator.new(), AGID is rejected at saga creation.
+#
+# A2A's involvement in user-closure is BYOA: a closed user may have
+# authored A2A contracts that connected their personal LLM keys to Chora
+# agents. Their contract tombstones; the contract's effect on platform
+# (e.g., per-tenant invocation history) persists with tokenised acting
+# user identifier.
+
+domain: chora_a2a
+version: "1.0"
+
+fields_to_tokenize:
+  - table: a2a_contracts
+    columns:
+      # Contract CREATED_BY (human GCID) is tombstoned; AGID side is preserved.
+      - column: created_by_display_name
+        strategy: tombstone_string
+        value: "Former member"
+      - column: created_by_email_snapshot
+        strategy: tombstone_email
+        value: "user-{hash}@redacted.invalid"
+
+  - table: byoa_credentials
+    columns:
+      # BYOA personal LLM credentials — DROP entirely on user closure.
+      # No reason to retain a closed user's OpenAI/Anthropic API key.
+      - column: encrypted_api_key
+        strategy: drop
+        value: ""
+      - column: provider_account_email
+        strategy: drop
+        value: ""
+
+  - table: a2a_invocations
+    columns:
+      # Invocation log — actor display name tokenised, the rest preserved
+      # for audit + cost reconciliation.
+      - column: actor_display_name
+        strategy: tombstone_string
+        value: "Former member"
+      # request_payload_hash + response_payload_hash preserved for audit.
+
+  - table: external_agent_identities
+    columns:
+      # AGID rows themselves are NOT touched by user closure (agents
+      # have no lifecycle). However, the GRANTING admin's display name
+      # may need tombstoning here.
+      - column: registered_by_display_name
+        strategy: tombstone_string
+        value: "Former member"
+
+  - table: api_keys
+    columns:
+      # Per-tenant API key issuance — issuing_admin GCID display tombstoned.
+      - column: issued_by_display_name
+        strategy: tombstone_string
+        value: "Former member"
+
+  - table: dns_txt_verifications
+    columns:
+      - column: requestor_display_name
+        strategy: tombstone_string
+        value: "Former member"
+
+retention_days_by_jurisdiction:
+  EU: 2557
+  SG: 2557
+  US: 1826
+  ZA: 1826
+  BR: 1826
+  default: 2557
+
+on_creator_closure:
+  # A2A contracts authored by the closed user persist (BYOA credential
+  # is dropped, but the contract metadata is needed for invocation audit).
+  strategy: tokenise_authorship_keep_atom
+  show_authorship_as: "Former member"
