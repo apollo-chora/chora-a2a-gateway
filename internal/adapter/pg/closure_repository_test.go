@@ -1,6 +1,6 @@
 // closure_repository_test.go — pgx adapter tests for the durable
 // ClosureRepository (W0-F1 durability + W0-F5 error-honesty, CHO-2198)
-// using the shared stub Querier (see partner_repository_test.go).
+// using the stub Querier below.
 //
 // These are unit tests against the SQL emit + scan surface — no live DB.
 // The critical assertions here are the W0-F5 ones: a genuine backing-store
@@ -22,6 +22,50 @@ import (
 	"github.com/apollo-chora/chora-a2a-gateway/internal/adapter/pg"
 	"github.com/apollo-chora/chora-a2a-gateway/internal/config"
 )
+
+// stubQuerier is the in-memory pg.Querier double shared by this file's
+// tests. rowSQL/rowArgs capture the most recent QueryRow call so tests can
+// assert on the emitted SQL template and bound arguments without a live DB.
+type stubQuerier struct {
+	execSQL  string
+	execArgs []any
+	execErr  error
+	row      *stubRow
+
+	rowSQL  string
+	rowArgs []any
+}
+
+func (s *stubQuerier) Exec(_ context.Context, sql string, args ...any) error {
+	s.execSQL = sql
+	s.execArgs = args
+	return s.execErr
+}
+
+func (s *stubQuerier) QueryRow(_ context.Context, sql string, args ...any) pg.Row {
+	s.rowSQL = sql
+	s.rowArgs = args
+	if s.row == nil {
+		return &stubRow{err: pg.ErrNoRows}
+	}
+	return s.row
+}
+
+func (s *stubQuerier) Query(_ context.Context, _ string, _ ...any) (pg.Rows, error) {
+	return nil, errors.New("stubQuerier: Query not stubbed")
+}
+
+type stubRow struct {
+	scan func(dest ...any) error
+	err  error
+}
+
+func (r *stubRow) Scan(dest ...any) error {
+	if r.scan != nil {
+		return r.scan(dest...)
+	}
+	return r.err
+}
 
 func closureSpecFixture() []config.TableSpec {
 	return []config.TableSpec{
