@@ -1,151 +1,148 @@
 # chora-a2a-gateway
 
-External Agent-to-Agent (A2A) gateway service for Chora per **ADR-132**. It
-handles all inbound A2A traffic from registered partner agents: partner
-registration, contract lifecycle, invocation, BYOA external-LLM keys, MCP
-add-on config, and the federated account-closure saga.
+## About
 
-The service is standalone and cloud-neutral: PostgreSQL repositories, a NATS
-JetStream event bus, OTLP tracing via `OTEL_EXPORTER_OTLP_ENDPOINT`, and
-env-backed configuration. No cloud account or managed services (managed SQL,
-message broker, secret manager, or CI/CD) are required.
+`chora-a2a-gateway` is the standalone HTTP and gRPC gateway for Chora's external Agent-to-Agent (A2A) integration. It accepts partner registration and A2A invocation traffic, manages contracts, partner-agent identities, BYOA external-LLM keys, MCP add-on configuration, DNS verification, and related audit/listing operations. The service uses PostgreSQL-backed repositories, a transactional outbox with NATS JetStream delivery, and OTLP tracing, with in-memory adapters available for local development and tests.
 
-## Identity model — AGID is NOT GCID
+## Quick start
 
-Per CLAUDE.md §1 and ADR-132 §2: **AGID** (`AgentGlobalID`) is a distinct
-identity class from human **GCID**. Agents CANNOT hold `TenantMembership`.
-Every aggregate in this service (`Partner`, `Session`, `ExternalAgentIdentity`)
-holds an `AGID` and **must never** carry a `gcid` field. The unit tests
-assert this invariant by inspecting the JSON output for a `"gcid"` key.
+Requires Go 1.26. The repository declares Go `1.26.1` in `go.mod`.
 
-## Endpoints
-
-| Method | Path                                  | Description                                       |
-|--------|---------------------------------------|---------------------------------------------------|
-| GET    | `/healthz`                            | Liveness probe                                    |
-| GET    | `/readyz`                             | Readiness probe                                   |
-| POST   | `/a2a/v1/invoke`                      | Primary A2A entry. `X-AGID` required.             |
-| GET    | `/a2a/v1/partners/{agid}`             | Fetch partner registry entry                      |
-| POST   | `/a2a/v1/partners`                    | Register a partner (admin placeholder)            |
-| GET    | `/a2a/v1/sessions/{correlation_id}`   | Fetch session log entry                           |
-| POST   | `/partners/register`                  | Partner registration (partner-facing)             |
-| GET    | `/contracts/`                         | Contract listing                                  |
-| POST   | `/a2a/invoke`                         | Partner-facing invoke                             |
-| GET    | `/api/v1/a2a/contracts`               | O+ A2A console contract listing (BFF)             |
-| GET    | `/api/v1/a2a/identities`              | O+ A2A console identity listing (BFF)             |
-| GET    | `/api/v1/a2a/invocations`             | O+ A2A console invocation listing (BFF)           |
-
-Required headers on `/a2a/v1/*` endpoints:
-
-- `X-AGID` — UUIDv7 of the calling partner agent (mandatory)
-- `X-Correlation-Id` — UUIDv7 unique per call (mandatory on `/invoke`)
-
-## Aggregates
-
-| Aggregate                  | Holds | Lifecycle                                        |
-|----------------------------|-------|--------------------------------------------------|
-| `A2APartnerRegistry`       | AGID  | Active <-> Suspended; SoftDelete                 |
-| `A2ASession`               | AGID  | **Append-only** — no UPDATE; new entry per call  |
-| `ExternalAgentIdentity`    | AGID  | PEM + Ed25519 fingerprint; Rotate                |
-
-## Rate limiting
-
-In-memory **token-bucket per AGID**. Configured from each partner's
-`rate_limit_per_minute`. Returns `429 RATE_LIMITED` when exhausted.
-
-## Local stack
-
-The service runs standalone with:
-
-- **PostgreSQL** — `chora_a2a` database, durable outbox, and subscriber
-  idempotency (migrations in `migrations/`)
-- **NATS JetStream** — local event publishing and subscriptions
-
-## Configuration
-
-Create the local environment file:
+Clone the repository and start the server:
 
 ```sh
+git clone https://github.com/apollo-chora/chora-a2a-gateway.git
+cd chora-a2a-gateway
+
 cp .env.example .env
+go run ./cmd/server
 ```
 
-The checked-in `.env.example` contains the complete local defaults. The actual
-`.env` file is ignored by Git.
-
-Important variables:
-
-| Variable | Purpose | Local default |
-| --- | --- | --- |
-| `PORT` | HTTP port | `8080` |
-| `CHORA_DB_DSN` | PostgreSQL connection string (app_rw role) | Compose PostgreSQL |
-| `CHORA_OUTBOX_DSN` | Durable outbox database | Same PostgreSQL instance |
-| `NATS_URL` | NATS JetStream event bus | `nats://nats:4222` |
-| `CHORA_SOURCE_PROJECT` | Source project label stamped on events | `chora-local` |
-| `CHORA_A2A_REPO_BACKEND` | `unset`/`pg` (durable) or `inmem` (dev) | unset |
-| `CHORA_PII_CLOSURE_MAP_PATH` | Per-domain closure PII map | `config/PII_Closure_Map.yaml` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC trace endpoint | `http://otel-collector:4317` |
-
-## Run locally
-
-From the repository root:
+For a local process-only run, leave the database and NATS settings unset and explicitly select the in-memory repository backend:
 
 ```sh
-go run ./cmd/server
-# in another shell
+CHORA_A2A_REPO_BACKEND=inmem go run ./cmd/server
+```
+
+The server listens on `:8080` by default. Check the service from another shell:
+
+```sh
 curl -s http://localhost:8080/healthz
+curl -s http://localhost:8080/readyz
+```
+
+The checked-in `.env.example` defines PostgreSQL as `chora_a2a`, NATS at `nats://nats:4222`, and the default PII closure map at `config/PII_Closure_Map.yaml`. The Dockerfile builds the service from the repository root and produces Linux `amd64` and `arm64` images in the repository's GitHub Actions workflow.
+
+## Usage
+
+The server exposes liveness and readiness endpoints, two REST surfaces, and read-only A2A listings.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/healthz` | Liveness |
+| `GET` | `/readyz` | Readiness |
+| `POST` | `/a2a/v1/invoke` | Primary A2A invocation entry |
+| `GET` | `/a2a/v1/partners/{agid}` | Look up a partner by AGID |
+| `POST` | `/a2a/v1/partners` | Register a partner in the legacy A2A v1 surface |
+| `GET` | `/a2a/v1/sessions/{correlation_id}` | Fetch a legacy invocation session |
+| `POST` | `/partners/register` | Partner-facing registration |
+| `GET` | `/partners/{id}` | Fetch a registration |
+| `GET` | `/admin/partners?status=...` | List registrations by state |
+| `POST` | `/admin/partners/{id}:approve` | Approve a partner and mint an AGID/API key |
+| `POST` | `/admin/partners/{id}:suspend` | Suspend a partner |
+| `POST` | `/admin/partners/{id}:reinstate` | Reinstate a partner |
+| `POST` | `/admin/partners/{id}:revoke` | Revoke a partner |
+| `POST` | `/contracts/{partner_id}` | Create a contract |
+| `GET` | `/contracts/{partner_id}` | List a partner's contracts |
+| `GET` | `/contracts/{partner_id}/openapi.yaml` | Get the contract's OpenAPI subset |
+| `POST` | `/a2a/invoke` | Partner-facing invocation |
+| `GET` | `/a2a/audit?partner_id=...` | Partner invocation audit |
+| `POST` | `/admin/byoa/{tenant_id}/{provider}` | Store an encrypted external-LLM API key |
+| `DELETE` | `/admin/byoa/{tenant_id}/{provider}` | Revoke a BYOA key |
+| `POST` | `/admin/mcp/{tenant_id}` | Configure an MCP add-on |
+| `GET` | `/admin/mcp/{tenant_id}` | Fetch MCP configuration |
+| `POST` | `/admin/mcp/{tenant_id}:suspend` | Suspend an MCP add-on |
+| `POST` | `/admin/mcp/{tenant_id}:reinstate` | Reinstate an MCP add-on |
+| `POST` | `/admin/mcp/_resolve` | Resolve an MCP API key to its tenant |
+| `POST` | `/admin/dns/verify` | Verify a partner domain's DNS TXT record |
+| `GET` | `/api/v1/a2a/contracts` | Console contract listing |
+| `GET` | `/api/v1/a2a/identities` | Console identity listing |
+| `GET` | `/api/v1/a2a/invocations?since=...` | Console invocation listing |
+
+Requests under `/a2a/v1/*` require the `X-AGID` header. The `/a2a/v1/invoke` endpoint also requires `X-Correlation-Id`. Both values are expected to use UUIDv7 identifiers.
+
+A basic invocation looks like this:
+
+```sh
 curl -s -X POST http://localhost:8080/a2a/v1/invoke \
   -H 'Content-Type: application/json' \
   -H 'X-AGID: 01970000-0000-7000-b000-000000000001' \
   -H 'X-Correlation-Id: 01970000-0000-7000-c000-000000000001' \
   -d '{"action":"sample.echo","params":{"hello":"world"}}'
-# Note: the bare local server has no seeded partners. The /invoke call
-# above will return 404 PARTNER_NOT_FOUND until a partner is registered.
 ```
 
-With the environment configured (`CHORA_DB_DSN`, `CHORA_OUTBOX_DSN`,
-`NATS_URL`), the service wires the durable Postgres repositories, the
-transactional outbox, and the NATS JetStream event bus. Unset, it falls back
-to the in-memory adapters (dev mode).
+With the bare `go run` process there is no seeded partner, so this request returns `404 PARTNER_NOT_FOUND` until a matching partner is registered.
 
-## Database
+The partner-facing `/a2a/invoke` route uses `X-Partner-Id`, `X-API-Key`, and `X-Correlation-Id`. Contracts define capabilities, authentication methods, versions, and per-capability rate limits.
 
-PostgreSQL is the durable backing store (`chora_a2a`). The same database is
-also used for the transactional outbox (`a2a_outbox_events`) and the closure
-subscriber idempotency store (`closure_pseudonymisation_state`). Schema
-changes live in `migrations/`.
+The rate limiter is an in-memory token bucket keyed by AGID. Built-in partner tiers configure default limits of `60`, `300`, `1200`, or `6000` requests per minute for `low`, `medium`, `high`, and `critical` tiers respectively. Requests that exhaust a bucket receive `429`.
 
-The migrations are applied by the platform migration runner
-(`scripts/migrate.sh` in the orchestrator repository), which mounts this
-repository's `migrations/` directory. Every forward migration is a `*.sql`
-file that is not a `*.down.sql`.
+Configuration is environment-backed:
 
-## Event bus
+| Variable | Purpose |
+| --- | --- |
+| `PORT` | HTTP listen port, default `8080` |
+| `CHORA_DB_DSN` | PostgreSQL runtime DSN |
+| `CHORA_OUTBOX_DSN` | PostgreSQL DSN for the transactional outbox |
+| `CHORA_DB_DSN_SECRET_ID` | Secret-backed database DSN when a direct DSN is not supplied |
+| `NATS_URL` | NATS JetStream URL |
+| `CHORA_SOURCE_PROJECT` | Source project value stamped on emitted events |
+| `CHORA_SOURCE_SERVICE` | Source service configuration |
+| `CHORA_A2A_REPO_BACKEND` | Repository backend: durable PostgreSQL or explicit `inmem` development mode |
+| `CHORA_A2A_REPO_TENANT_ID` | Tenant binding used by PostgreSQL A2A repositories |
+| `CHORA_CLOSURE_SUBSCRIPTION` | Closure-saga consumer name |
+| `CHORA_PII_CLOSURE_MAP_PATH` | Path to the PII closure map |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC endpoint |
+| `CHORA_OUTBOX_WORKER_ID` | Outbox dispatcher worker ID |
+| `CHORA_BOOTSTRAP_TIMEOUT_SECONDS` | Bootstrap timeout |
+| `CHORA_DURABILITY_GUARD` | Durability guard mode, `report` or `enforce` |
 
-Local messaging uses NATS JetStream. The event taxonomy
-(`chora.{domain}.{aggregate}.{event_type}.v{N}`) is unchanged, and the transport
-is brokered by `github.com/apollo-chora/chora-common/eventbus`.
+PostgreSQL is the durable store for registrations, contracts, invocations, MCP configuration, BYOA credentials, agent identities, and closure/outbox state when the PostgreSQL backend is selected. Schema files are under `migrations/`.
 
-Two streams are provisioned: `CHORA_EVENTS` (subjects `chora.>`) and
-`CHORA_DLQ` (subjects `_dlq.>`, the dead-letter convention). Consumers are
-durable and created on demand by the service. If `NATS_URL` is unset the
-application falls back to its in-memory event bus (publish-only; not durable).
+Events are emitted through the `chora-common/eventbus` package. The producer-side transactional outbox is stored in `a2a_outbox_events` and dispatched to NATS JetStream. The configured event streams are `CHORA_EVENTS` for `chora.>` subjects and `CHORA_DLQ` for dead-letter subjects.
 
-## Tests
+## Development
+
+Build the server:
+
+```sh
+go build ./cmd/server
+```
+
+Run the complete unit test suite with coverage:
 
 ```sh
 go test ./... -cover
 ```
 
-Real-Postgres repository tests run under the `integration` build tag and are
-skipped unless `CHORA_TEST_DSN` is set:
+Run the PostgreSQL integration tests with the `integration` build tag and `CHORA_TEST_DSN`:
 
 ```sh
-CHORA_TEST_DSN=postgres://chora:chora@localhost:5432/chora_a2a?sslmode=disable \
-  go test -tags integration ./internal/adapter/repo/pg/...
+CHORA_TEST_DSN='postgres://chora:chora@localhost:5432/chora_a2a?sslmode=disable' \
+  go test -tags=integration ./internal/adapter/repo/pg/...
 ```
 
-## References
+The main directories are:
 
-- `chora-contracts/openapi/a2a-gateway.yaml`
-- `chora-contracts/proto/events/a2a/{contract,external_agent,invocation}.proto`
-- CLAUDE.md §1 (AGID-vs-GCID), §3 (A2A as core domain)
+```text
+cmd/server/                 Service entry point and bootstrap
+internal/adapter/           HTTP, gRPC, PostgreSQL, in-memory, DNS, events, outbox, and rate-limiter adapters
+internal/config/            PII closure-map configuration loading
+internal/domain/            Partner, contract, invocation, MCP, BYOA, identity, and session domain models
+internal/observability/     OTLP and traceparent middleware
+migrations/                 PostgreSQL schema migrations
+config/                     PII_Closure_Map.yaml
+Dockerfile                  Container build
+```
+
+The legacy `/a2a/v1/*` surface currently uses in-memory partner and session stores. The newer partner-facing registration, contract, invocation, MCP, BYOA, and identity repositories are selected during bootstrap according to `CHORA_A2A_REPO_BACKEND`; PostgreSQL is used when durable storage is configured, while `inmem` is an explicit development backend.
